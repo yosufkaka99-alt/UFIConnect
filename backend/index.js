@@ -60,6 +60,7 @@ const { VAULT_STORAGE_SCHEMA, registerVaultStorageRoutes } = require('./vault-st
 const { createOfficeAgentChat, sanitizeSnapshot: sanitizeAgentSnapshot } = require('./office-agent-chat');
 const { createOfficeAI, createOfficeAIModel } = require('./office-ai');
 const { registerOfficeFocusLive } = require('./office-focus-live');
+const { initializeOfficeFocusLive } = require('./office-focus-live-store');
 const { FOCUS_SCHEMA, createFocusSync, registerFocusRoutes } = require('./focus-sync');
 const { createOfficeAIStudio } = require('./office-ai-studio');
 const { createOfficeAIStudioKeys } = require('./office-ai-studio-keys');
@@ -471,7 +472,8 @@ app.use('/office/agents/:id/chat', (_req, res, next) => { res.set('Cache-Control
   requireOfficeToken, express.json({ limit: '1mb', strict: true }),
   (error, _req, res, _next) => res.status(error.status === 413 ? 413 : 400).json({ error: 'Invalid agent chat request.' }));
 app.use(privateConnectionResponse);
-registerOfficeFocusLive(app, { requireOfficeToken, api: SERVICE_ROLE === 'api', json: express.json });
+const officeFocusLive = registerOfficeFocusLive(app, { requireOfficeToken, api: SERVICE_ROLE === 'api', json: express.json,
+  db, encryptionKey: process.env.OAUTH_TOKEN_ENCRYPTION_KEY });
 // Authenticate before accepting a bounded encrypted Vault envelope. Other API
 // routes retain their smaller default body limit.
 registerVaultStorageRoutes(app, { db, authenticate, json: express.json,
@@ -17138,6 +17140,7 @@ async function migrateDB() {
     for (const statement of BILLING_SCHEMA) await db.query(statement);
     for (const statement of MANAGED_VPN_SCHEMA) await db.query(statement);
     for (const statement of FOCUS_SCHEMA) await db.query(statement);
+    await initializeOfficeFocusLive(db);
     for (const statement of BUSINESS_TEAM_SCHEMA) await db.query(statement);
 
     // Groups table — persists across deploys
@@ -20426,6 +20429,9 @@ function requireOfficeToken(req, res, next) {
 
 const focusSync = createFocusSync({ db, encryptionKey: process.env.OAUTH_TOKEN_ENCRYPTION_KEY });
 if (!IS_PIPELINE_ROLE) {
+  scheduleRecurring(() => {
+    if (db.isConnected()) return officeFocusLive.prune().catch(() => console.warn('[office live GPS] Privacy cleanup will retry.'));
+  }, 5000);
   registerFocusRoutes(app, { service: focusSync, requireOfficeToken, authenticate,
     enabled: () => db.isConnected() && process.env.FOCUS_SYNC_ENABLED !== 'false' && Boolean(process.env.OAUTH_TOKEN_ENCRYPTION_KEY),
     limiter: rateLimit({ windowMs: 60_000, limit: 120, keyGenerator: rateLimitKey, standardHeaders: true, legacyHeaders: false }) });

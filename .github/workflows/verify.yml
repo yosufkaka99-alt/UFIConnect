@@ -288,9 +288,39 @@ jobs:
             .cache/audit-ui/
             .cache/office-ai-responsive/
           include-hidden-files: true
+  focus_live_postgres:
+    needs: release_evidence
+    if: needs.release_evidence.outputs.reuse != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: focus_test
+          POSTGRES_PASSWORD: local-test-only
+          POSTGRES_DB: focus_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U focus_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --prefix backend --no-audit --no-fund
+      - run: node --test backend/office-focus-live-postgres.test.js
+        env:
+          FOCUS_LIVE_TEST_POSTGRES_URL: postgres://focus_test:local-test-only@127.0.0.1:5432/focus_test
   verify:
     runs-on: ubuntu-latest
-    needs: [release_evidence, verify_checks, native]
+    needs: [release_evidence, verify_checks, native, focus_live_postgres]
     if: ${{ always() }}
     steps:
       - name: Require every verification group to pass
@@ -299,14 +329,17 @@ jobs:
           REUSE: ${{ needs.release_evidence.outputs.reuse }}
           CHECKS_RESULT: ${{ needs.verify_checks.result }}
           NATIVE_RESULT: ${{ needs.native.result }}
+          FOCUS_LIVE_RESULT: ${{ needs.focus_live_postgres.result }}
         run: |
           test "$EVIDENCE_RESULT" = "success"
           if [[ "$REUSE" == "true" ]]; then
             test "$CHECKS_RESULT" = "skipped"
             test "$NATIVE_RESULT" = "skipped"
+            test "$FOCUS_LIVE_RESULT" = "skipped"
           else
             test "$CHECKS_RESULT" = "success"
             test "$NATIVE_RESULT" = "success"
+            test "$FOCUS_LIVE_RESULT" = "success"
           fi
   native:
     needs: release_evidence

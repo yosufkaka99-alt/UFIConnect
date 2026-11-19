@@ -14,6 +14,7 @@ import { DIAGNOSTIC_OPTIONS_KEY } from '../office/src/focus-device-health.mjs';
 const require = createRequire(import.meta.url);
 const express = require('../backend/node_modules/express');
 const { registerOfficeFocusLive } = require('../backend/office-focus-live');
+const { createLiveDatabase } = require('../backend/test-support/office-focus-live-db');
 const livePath = '/office/focus/live';
 const officeToken = 'browser-test-only';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -63,9 +64,11 @@ const clockStart = new Date('2026-11-13T16:00:00Z');
 let server;
 let browser;
 let origin;
+let liveDatabase;
 before(async () => {
+  liveDatabase = await createLiveDatabase();
   const liveApi = express();
-  registerOfficeFocusLive(liveApi, { api: true, json: express.json,
+  registerOfficeFocusLive(liveApi, { ...liveDatabase, api: true, json: express.json,
     requireOfficeToken: (request, response, next) => request.get('x-office-token') === officeToken ? next() : response.sendStatus(401) });
   server = await createServer({
     root: path.join(root, 'office'),
@@ -96,6 +99,7 @@ before(async () => {
 after(async () => {
   await browser?.close();
   await server?.close();
+  await liveDatabase?.close();
 });
 
 async function openStudio(t, { settings = {}, mock = true, blocked = false, width = 1200, disableWebGL = false, phoneSync, deviceMocks = false, officeClient = false } = {}) {
@@ -1805,4 +1809,128 @@ test('walk start capture times out, cancels when hidden and respects an intentio
   await page.clock.fastForward(3000);
   await fix(page, point(.0005));
   await walk.getByText(/^1 point/).waitFor();
+});
+
+async function mockedPublisher(t, response = () => ({ status: 204 })) {
+  const page = await openStudio(t, { width: 390, disableWebGL: true });
+  const record = { id: '00000000-0000-4000-8000-000000000001', publisher: '00000000-0000-4000-8000-000000000002' };
+  const calls = { enroll: 0, publish: 0, cancel: 0 };
+  await page.route(`**${livePath}`, route => {
+    if (route.request().method() !== 'POST') return route.continue();
+    calls.enroll++;
+    return route.fulfill({ status: 201, json: record });
+  });
+  await page.route(`**${livePath}/*`, route => {
+    if (route.request().method() === 'DELETE') { calls.cancel++; return route.fulfill({ status: 204 }); }
+    calls.publish++;
+    assert.equal(route.request().headers()['x-focus-publisher'], record.publisher);
+    return route.fulfill(response());
+  });
+  await button(page, 'Live Maps').click();
+  await button(page, 'Start live GPS').click();
+  await fix(page, point(12.42));
+  await button(page, 'Share my GPS with Office').click();
+  await textVisible(page, 'Waiting for GPS');
+  return { page, calls };
+}
+
+test('publisher retries gateway 404, 503, 429 and network failures using the same consent and session', async t => {
+  let response = { status: 404, body: 'Synthetic gateway response' };
+  const { page, calls } = await mockedPublisher(t, () => response);
+  await page.clock.fastForward(3500);
+  await page.getByRole('alert').filter({ hasText: 'HTTP 404' }).waitFor();
+  assert.equal(await button(page, 'Stop sharing my GPS').getAttribute('aria-pressed'), 'true');
+  for (const status of [503, 429]) {
+    response = { status, json: { error: 'Synthetic temporary error' } };
+    await fix(page, point(12.42));
+    await page.evaluate(() => window.dispatchEvent(new Event('online')));
+    await page.getByRole('alert').filter({ hasText: `HTTP ${status}` }).waitFor();
+  }
+  await page.route(`**${livePath}/*`, route => route.request().method() === 'PUT' ? route.abort() : route.fallback());
+  await page.evaluate(() => window.dispatchEvent(new Event('online')));
+  await page.getByRole('alert').filter({ hasText: 'No Office response was received' }).waitFor();
+  await page.unroute(`**${livePath}/*`);
+  await page.route(`**${livePath}/*`, route => {
+    if (route.request().method() === 'DELETE') { calls.cancel++; return route.fulfill({ status: 204 }); }
+    calls.publish++;
+    return route.fulfill({ status: 204 });
+  });
+  await page.evaluate(() => window.dispatchEvent(new Event('online')));
+  await textVisible(page, 'Sharing live GPS');
+  assert.equal(calls.enroll, 1, 'recovery never silently enrolls another session');
+  await button(page, 'Stop sharing my GPS').click();
+  await page.waitForFunction(() => document.querySelector('button[aria-pressed="false"]'));
+  const before = calls.publish;
+  await page.clock.fastForward(10000);
+  await page.evaluate(() => window.dispatchEvent(new Event('online')));
+  assert.equal(calls.publish, before, 'Stop prevents later retries from publishing');
+});
+
+for (const status of [401, 403, 423, 404]) {
+  test(`publisher stops on authoritative HTTP ${status} and requires renewed consent`, async t => {
+    const { page, calls } = await mockedPublisher(t, () => ({ status, json: { code: status === 404 ? 'FOCUS_LIVE_ENDED' : 'ACCESS_DENIED' } }));
+    await page.clock.fastForward(3500);
+    await page.getByRole('alert').filter({ hasText: 'The sharing session ended' }).waitFor();
+    assert.equal(await button(page, 'Share my GPS with Office').getAttribute('aria-pressed'), 'false');
+    const before = calls.publish;
+    await page.clock.fastForward(10000);
+    await fix(page, point(12.42));
+    await page.evaluate(() => window.dispatchEvent(new Event('online')));
+    assert.equal(calls.publish, before);
+    assert.equal(calls.enroll, 1);
+  });
+}
+
+test('an offline publisher stops after the session lease expires and never reenrolls itself', async t => {
+  const { page, calls } = await mockedPublisher(t);
+  await page.clock.fastForward(3500);
+  await textVisible(page, 'Sharing live GPS');
+  await page.evaluate(() => Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => false }));
+  await page.clock.fastForward(95000);
+  await page.getByRole('alert').filter({ hasText: 'The sharing session expired' }).waitFor();
+  assert.equal(await button(page, 'Share my GPS with Office').getAttribute('aria-pressed'), 'false');
+  const before = calls.publish;
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => true });
+    window.dispatchEvent(new Event('online'));
+  });
+  await fix(page, point(12.42));
+  assert.equal(calls.publish, before);
+  assert.equal(calls.enroll, 1);
+});
+
+test('late enrollment is revoked after Stop, hiding, GPS shutdown or leaving Focus', async t => {
+  for (const stop of ['button', 'hidden', 'gps', 'close']) {
+    await t.test(stop, async t => {
+      const page = await openStudio(t, { width: 390, disableWebGL: true });
+      const pending = Promise.withResolvers(), release = Promise.withResolvers();
+      let cancellations = 0, publishes = 0;
+      await page.route(`**${livePath}`, async route => {
+        if (route.request().method() !== 'POST') return route.continue();
+        pending.resolve();
+        await release.promise;
+        await route.fulfill({ status: 201, json: { id: 'late-session', publisher: 'late-publisher' } });
+      });
+      await page.route(`**${livePath}/*`, route => {
+        if (route.request().method() === 'DELETE') cancellations++; else publishes++;
+        return route.fulfill({ status: 204 });
+      });
+      await button(page, 'Live Maps').click();
+      await button(page, 'Start live GPS').click();
+      await fix(page, point(12.42));
+      await button(page, 'Share my GPS with Office').click();
+      await pending.promise;
+      if (stop === 'button') await button(page, 'Stop sharing my GPS').click();
+      if (stop === 'hidden') await page.evaluate(() => window.focusTest.visibility(true));
+      if (stop === 'gps') await button(page, 'Stop live GPS').click();
+      if (stop === 'close') await page.evaluate(() => window.setFocusOpen(false));
+      const deleted = page.waitForResponse(response => response.request().method() === 'DELETE' && response.url().includes(livePath));
+      release.resolve();
+      await deleted;
+      assert.equal(cancellations, 1);
+      assert.equal(publishes, 0);
+      await page.clock.fastForward(10000);
+      assert.equal(publishes, 0);
+    });
+  }
 });

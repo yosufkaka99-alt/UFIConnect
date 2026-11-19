@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { createAppHarness } = require('./test-support/app-harness');
+const { createLiveDatabase } = require('./test-support/office-focus-live-db');
 
 const path = '/office/focus/live';
 const token = 'synthetic-office-live';
@@ -8,8 +9,10 @@ const headers = { 'x-office-token': token };
 const point = { latitude: 37, longitude: -122, accuracy: 4, age: 0, speed: 13, heading: 89 };
 
 test('Office live GPS requires Office access and a separate publisher credential', async t => {
-  const app = await createAppHarness({ env: { OFFICE_TOKEN: token } });
-  t.after(() => app.close());
+  const fixture = await createLiveDatabase();
+  const app = await createAppHarness({ env: { OFFICE_TOKEN: token, OAUTH_TOKEN_ENCRYPTION_KEY: fixture.encryptionKey },
+    connected: true, query: fixture.db.query, withClient: fn => fixture.db.withClient(fn) });
+  t.after(async () => { await app.close(); await fixture.close(); });
   assert.equal((await app.request(path)).status, 401);
   const unauthorized = await app.request(path, { method: 'POST', body: { name: 'Van', kind: 'vehicle', type: 'van' } });
   assert.equal(unauthorized.status, 401);
@@ -48,11 +51,13 @@ test('Office live GPS requires Office access and a separate publisher credential
 
 test('Office live devices disappear when their GPS fix expires', async t => {
   let time = 1_000_000;
+  const fixture = await createLiveDatabase();
   const { registerOfficeFocusLive } = require('./office-focus-live');
-  const app = await createAppHarness({ env: { OFFICE_TOKEN: token }, modules: {
+  const app = await createAppHarness({ env: { OFFICE_TOKEN: token, OAUTH_TOKEN_ENCRYPTION_KEY: fixture.encryptionKey },
+    connected: true, query: fixture.db.query, withClient: fn => fixture.db.withClient(fn), modules: {
     './office-focus-live': { registerOfficeFocusLive: (app, options) => registerOfficeFocusLive(app, { ...options, now: () => time }) },
   } });
-  t.after(() => app.close());
+  t.after(async () => { await app.close(); await fixture.close(); });
   const enrollment = await app.request(path, { method: 'POST', headers, body: { name: 'Bike', kind: 'bicycle' } });
   const { id, publisher } = enrollment.data;
   const publish = () => app.request(`${path}/${id}`, { method: 'PUT', headers: { ...headers, 'x-focus-publisher': publisher },

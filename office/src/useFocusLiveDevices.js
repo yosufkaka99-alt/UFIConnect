@@ -5,11 +5,13 @@ import { assessTrackingFix } from './focus-tracking.mjs';
 import { createVisibleOfficePoller } from './office-polling.mjs';
 
 const UPDATE_MS = 3500;
+const SESSION_LIFETIME_MS = 90000;
 const EMPTY = [];
 const retryDelay = failures => Math.min(30000, UPDATE_MS * 2 ** Math.min(4, failures));
-function responseError(response) {
+async function responseError(response) {
   const error = new Error(`HTTP ${response.status}`);
   error.status = response.status;
+  try { error.code = (await response.json()).code; } catch { /* Gateways can return non-JSON errors. */ }
   return error;
 }
 function failureMessage(error) {
@@ -30,6 +32,7 @@ export default function useFocusLiveDevices(transport, tracking) {
   const [shareError, setShareError] = useState('');
   const [connection, setConnection] = useState(null);
   const session = useRef(null);
+  const enrolling = useRef(false);
   const generation = useRef(0);
   const canShare = tracking.enabled && tracking.visible;
   const recordDiagnostic = tracking.recordDiagnostic;
@@ -48,12 +51,14 @@ export default function useFocusLiveDevices(transport, tracking) {
 
   const revoke = useCallback(record => {
     if (!record?.id || !request) return;
-    void request(`${url}/${record.id}`, { method: 'DELETE', keepalive: true,
+    void (record.request ?? request)(`${record.url ?? url}/${record.id}`, { method: 'DELETE', keepalive: true,
+      signal: AbortSignal.timeout(5000),
       headers: { 'x-focus-publisher': record.publisher } }).catch(() => {});
   }, [request, url]);
 
   const stopSharing = useCallback(() => {
     generation.current++;
+    enrolling.current = false;
     const record = session.current;
     session.current = null;
     record?.controller.abort();
@@ -62,11 +67,15 @@ export default function useFocusLiveDevices(transport, tracking) {
     if (record) recordDiagnostic?.('SHARING_STOPPED', 'Local publishing stopped and revocation was requested. If Office is unreachable, the last shared fix expires within 25 seconds. Restart sharing explicitly when visible.');
   }, [revoke, recordDiagnostic]);
 
-  useEffect(() => () => {
-    generation.current++;
-    session.current?.controller.abort();
-    revoke(session.current);
-    session.current = null;
+  useEffect(() => {
+    setSharing('');
+    enrolling.current = false;
+    return () => {
+      generation.current++;
+      session.current?.controller.abort();
+      revoke(session.current);
+      session.current = null;
+    };
   }, [revoke]);
 
   useEffect(() => {
@@ -75,11 +84,13 @@ export default function useFocusLiveDevices(transport, tracking) {
   }, [canShare, stopSharing]);
 
   async function share(profile) {
-    if (!request || !canShare || session.current || sharing) return;
+    if (!request || !canShare || session.current || sharing || enrolling.current) return;
     const attempt = ++generation.current;
+    enrolling.current = true;
     setSharing('Starting…');
     setShareError('');
     try {
+      const attemptedAt = Date.now();
       const started = performance.now();
       const response = await request(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -87,11 +98,11 @@ export default function useFocusLiveDevices(transport, tracking) {
           { name: 'Office phone', kind: 'phone' }),
         signal: AbortSignal.timeout(7000),
       });
-      if (generation.current !== attempt) return;
-      observeResponse(response, started);
-      if (!response.ok) throw responseError(response);
+      if (generation.current === attempt) observeResponse(response, started);
+      if (!response.ok) throw await responseError(response);
       const result = await response.json();
-      const record = { ...result, controller: new AbortController(), lastSent: null, sending: false, failures: 0, retryAt: 0 };
+      const record = { ...result, request, url, controller: new AbortController(), lastSent: null,
+        sending: false, failures: 0, retryAt: 0, leaseUntil: attemptedAt + SESSION_LIFETIME_MS };
       if (generation.current !== attempt) { revoke(record); return; }
       session.current = record;
       setSharing('Waiting for GPS');
@@ -100,6 +111,8 @@ export default function useFocusLiveDevices(transport, tracking) {
       if (generation.current !== attempt) return;
       setSharing('');
       setShareError(observeFailure(error, 'Start sharing'));
+    } finally {
+      if (generation.current === attempt) enrolling.current = false;
     }
   }
 
@@ -108,6 +121,12 @@ export default function useFocusLiveDevices(transport, tracking) {
     const fix = tracking.liveFix;
     const time = Date.now();
     if (!record || record.sending || !canShare || document.hidden) return;
+    if (time >= record.leaseUntil) {
+      stopSharing();
+      setShareError('The sharing session expired. Start sharing again to reconnect.');
+      recordDiagnostic?.('SHARING_SESSION_ENDED', 'The sharing lease expired without an accepted update. Renew sharing explicitly.');
+      return;
+    }
     if (navigator.onLine === false || time < record.retryAt) return;
     if (!liveMovementFix(fix, time) || fix.accuracy > 5000) {
       setSharing('Waiting for GPS');
@@ -126,17 +145,21 @@ export default function useFocusLiveDevices(transport, tracking) {
       });
       if (session.current !== record) return;
       observeResponse(response, started);
-      if (response.status === 404 || response.status === 401 || response.status === 423) {
+      const error = response.ok ? null : await responseError(response);
+      if (session.current !== record) return;
+      if ([401, 403, 423].includes(response.status) || response.status === 404 && error.code === 'FOCUS_LIVE_ENDED') {
         stopSharing();
         setShareError('The sharing session ended. Start sharing again to reconnect.');
         recordDiagnostic?.('SHARING_SESSION_ENDED', `Office returned HTTP ${response.status}. Renew sharing to reconnect.`);
         return;
       }
-      if (!response.ok) throw responseError(response);
+      if (error) throw error;
       if (record.failures) recordDiagnostic?.('SHARING_RECOVERED', 'Office accepted a fresh GPS update after reconnection.');
       record.failures = 0;
       record.retryAt = 0;
       record.lastSent = fix.timestamp;
+      // Use request start, rather than response time, for a conservative lease.
+      record.leaseUntil = time + SESSION_LIFETIME_MS;
       setSharing('Sharing live GPS');
       setShareError('');
     } catch (error) {
@@ -175,7 +198,7 @@ export default function useFocusLiveDevices(transport, tracking) {
         const response = await request(url, { cache: 'no-store', signal: AbortSignal.any([signal, AbortSignal.timeout(7000)]) });
         if (signal.aborted) return;
         observeResponse(response, started);
-        if (!response.ok) throw responseError(response);
+        if (!response.ok) throw await responseError(response);
         const { sources: list } = await response.json();
         if (signal.aborted) return;
         const now = Date.now();
